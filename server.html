@@ -1,0 +1,1478 @@
+const express = require("express");
+const cors = require("cors");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const Database = require("better-sqlite3");
+
+const app = express();
+
+app.use(cors());
+app.use(express.json());
+
+const PORT = process.env.PORT || 3000;
+
+const JWT_SECRET =
+  process.env.JWT_SECRET || "TALA_FAMILY_SECRET_CHANGE_ME";
+
+const db = new Database("family.db");
+
+db.pragma("journal_mode = WAL");
+db.pragma("foreign_keys = ON");
+
+
+// ===============================
+// إنشاء جدول المستخدمين
+// ===============================
+
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    name TEXT NOT NULL,
+
+    national_id TEXT NOT NULL UNIQUE,
+
+    phone TEXT NOT NULL UNIQUE,
+
+    password TEXT NOT NULL,
+
+    marital_status TEXT NOT NULL,
+
+    wives_count INTEGER DEFAULT 0,
+
+    wives_ids TEXT DEFAULT '[]',
+
+    wives_data TEXT DEFAULT '[]',
+
+    children_count INTEGER DEFAULT 0,
+
+    children_data TEXT DEFAULT '[]',
+
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`).run();
+
+
+// ===============================
+// إنشاء جدول المجالس
+// ===============================
+
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS councils (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    name TEXT NOT NULL UNIQUE,
+
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`).run();
+
+
+// ===============================
+// إنشاء جدول أعضاء المجالس
+// ===============================
+
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS council_members (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    council_id INTEGER NOT NULL,
+
+    user_id INTEGER NOT NULL,
+
+    joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+
+    UNIQUE(council_id, user_id),
+
+    FOREIGN KEY(council_id)
+      REFERENCES councils(id)
+      ON DELETE CASCADE,
+
+    FOREIGN KEY(user_id)
+      REFERENCES users(id)
+      ON DELETE CASCADE
+  )
+`).run();
+
+
+// ===============================
+// إنشاء جدول المنشورات
+// ===============================
+
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS posts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    council_id INTEGER NOT NULL,
+
+    user_id INTEGER NOT NULL,
+
+    content TEXT NOT NULL,
+
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY(council_id)
+      REFERENCES councils(id)
+      ON DELETE CASCADE,
+
+    FOREIGN KEY(user_id)
+      REFERENCES users(id)
+      ON DELETE CASCADE
+  )
+`).run();// ===============================
+// إضافة الأعمدة الناقصة إذا كان
+// جدول المستخدمين موجودًا من قبل
+// ===============================
+
+function columnExists(tableName, columnName) {
+  const columns = db
+    .prepare(`PRAGMA table_info(${tableName})`)
+    .all();
+
+  return columns.some(
+    column => column.name === columnName
+  );
+}
+
+
+// إضافة بيانات الزوجات
+if (!columnExists("users", "wives_data")) {
+  db.prepare(`
+    ALTER TABLE users
+    ADD COLUMN wives_data TEXT DEFAULT '[]'
+  `).run();
+}
+
+
+// إضافة بيانات الأبناء
+if (!columnExists("users", "children_data")) {
+  db.prepare(`
+    ALTER TABLE users
+    ADD COLUMN children_data TEXT DEFAULT '[]'
+  `).run();
+}
+
+
+// ===============================
+// إنشاء المجالس الأساسية
+// ===============================
+
+const createCouncil = db.prepare(`
+  INSERT OR IGNORE INTO councils (name)
+  VALUES (?)
+`);
+
+createCouncil.run(
+  "مجلس العائلة في مخيم المغازي"
+);
+
+createCouncil.run(
+  "مجلس العائلة في مخيم النصيرات"
+);
+
+
+// ===============================
+// دوال التحقق
+// ===============================
+
+function isValidName(name) {
+  if (typeof name !== "string") {
+    return false;
+  }
+
+  const parts = name
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+
+  return parts.length === 3;
+}
+
+
+function isValidNationalId(id) {
+  return /^\d{9}$/.test(String(id));
+}
+
+
+function isValidPhone(phone) {
+  return /^(059|056)\d{7}$/.test(String(phone));
+}
+
+
+// ===============================
+// التحقق من التوكن
+// ===============================
+
+function authenticate(req, res, next) {
+
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader) {
+    return res.status(401).json({
+      success: false,
+      message: "يجب تسجيل الدخول أولاً"
+    });
+  }
+
+  const parts = authHeader.split(" ");
+
+  if (
+    parts.length !== 2 ||
+    parts[0] !== "Bearer"
+  ) {
+    return res.status(401).json({
+      success: false,
+      message: "رمز الدخول غير صالح"
+    });
+  }
+
+  const token = parts[1];
+
+  try {
+
+    const decoded = jwt.verify(
+      token,
+      JWT_SECRET
+    );
+
+    req.user = decoded;
+
+    next();
+
+  } catch (error) {
+
+    return res.status(401).json({
+      success: false,
+      message: "انتهت صلاحية تسجيل الدخول"
+    });
+  }
+}// ===============================
+// تسجيل حساب جديد
+// ===============================
+
+app.post("/api/register", async (req, res) => {
+
+  try {
+
+    const {
+      name,
+      nationalId,
+      phone,
+      password,
+      maritalStatus,
+      wivesCount,
+      wives,
+      childrenCount,
+      children
+    } = req.body;
+
+
+    // ===============================
+    // التحقق من الاسم
+    // ===============================
+
+    if (!isValidName(name)) {
+
+      return res.status(400).json({
+        success: false,
+        message: "يجب كتابة الاسم الثلاثي بشكل صحيح"
+      });
+
+    }
+
+
+    // ===============================
+    // التحقق من الهوية
+    // ===============================
+
+    if (!isValidNationalId(nationalId)) {
+
+      return res.status(400).json({
+        success: false,
+        message: "رقم الهوية يجب أن يتكون من 9 أرقام"
+      });
+
+    }
+
+
+    // ===============================
+    // التحقق من الهاتف
+    // ===============================
+
+    if (!isValidPhone(phone)) {
+
+      return res.status(400).json({
+        success: false,
+        message:
+          "رقم الهاتف يجب أن يبدأ بـ 059 أو 056 ويتكون من 10 أرقام"
+      });
+
+    }
+
+
+    // ===============================
+    // التحقق من كلمة المرور
+    // ===============================
+
+    if (
+      typeof password !== "string" ||
+      password.length < 6
+    ) {
+
+      return res.status(400).json({
+        success: false,
+        message:
+          "كلمة المرور يجب أن تكون 6 أحرف أو أرقام على الأقل"
+      });
+
+    }
+
+
+    // ===============================
+    // التحقق من الحالة الاجتماعية
+    // ===============================
+
+    if (
+      maritalStatus !== "متزوج" &&
+      maritalStatus !== "أعزب"
+    ) {
+
+      return res.status(400).json({
+        success: false,
+        message: "اختر الحالة الاجتماعية"
+      });
+
+    }
+
+
+    // ===============================
+    // تجهيز الزوجات
+    // ===============================
+
+    let wivesArray = [];
+
+    if (maritalStatus === "متزوج") {
+
+      if (
+        !Number.isInteger(Number(wivesCount)) ||
+        Number(wivesCount) < 1 ||
+        Number(wivesCount) > 20
+      ) {
+
+        return res.status(400).json({
+          success: false,
+          message:
+            "عدد الزوجات يجب أن يكون من 1 إلى 20"
+        });
+
+      }
+
+
+      if (!Array.isArray(wives)) {
+
+        return res.status(400).json({
+          success: false,
+          message: "بيانات الزوجات غير صحيحة"
+        });
+
+      }
+
+
+      if (wives.length !== Number(wivesCount)) {
+
+        return res.status(400).json({
+          success: false,
+          message: "عدد الزوجات لا يطابق البيانات المرسلة"
+        });
+
+      }
+
+
+      for (const wife of wives) {
+
+        if (!isValidName(wife.name)) {
+
+          return res.status(400).json({
+            success: false,
+            message:
+              "يجب كتابة اسم الزوجة ثلاثيًا"
+          });
+
+        }
+
+
+        if (!isValidNationalId(wife.nationalId)) {
+
+          return res.status(400).json({
+            success: false,
+            message:
+              "رقم هوية الزوجة يجب أن يتكون من 9 أرقام"
+          });
+
+        }
+
+
+        wivesArray.push({
+          name: wife.name.trim(),
+          nationalId: String(wife.nationalId)
+        });
+
+      }
+
+    }
+
+
+    // ===============================
+    // تجهيز الأبناء
+    // ===============================
+
+    let childrenArray = [];
+
+    const finalChildrenCount =
+      Number(childrenCount || 0);
+
+
+    if (
+      !Number.isInteger(finalChildrenCount) ||
+      finalChildrenCount < 0 ||
+      finalChildrenCount > 100
+    ) {
+
+      return res.status(400).json({
+        success: false,
+        message:
+          "عدد الأبناء يجب أن يكون من 0 إلى 100"
+      });
+
+    }
+
+
+    if (finalChildrenCount > 0) {
+
+      if (!Array.isArray(children)) {
+
+        return res.status(400).json({
+          success: false,
+          message: "بيانات الأبناء غير صحيحة"
+        });
+
+      }
+
+
+      if (children.length !== finalChildrenCount) {
+
+        return res.status(400).json({
+          success: false,
+          message:
+            "عدد الأبناء لا يطابق البيانات المرسلة"
+        });
+
+      }
+
+
+      for (const child of children) {
+
+        if (!isValidName(child.name)) {
+
+          return res.status(400).json({
+            success: false,
+            message:
+              "يجب كتابة اسم الابن أو الابنة ثلاثيًا"
+          });
+
+        }
+
+
+        if (!isValidNationalId(child.nationalId)) {
+
+          return res.status(400).json({
+            success: false,
+            message:
+              "رقم هوية الابن أو الابنة يجب أن يتكون من 9 أرقام"
+          });
+
+        }
+
+
+        childrenArray.push({
+          name: child.name.trim(),
+          nationalId: String(child.nationalId)
+        });
+
+      }
+
+    }
+
+
+    // ===============================
+    // التأكد من عدم وجود الحساب
+    // ===============================
+
+    const existingUser = db.prepare(`
+      SELECT id
+      FROM users
+      WHERE national_id = ?
+         OR phone = ?
+    `).get(
+      String(nationalId),
+      String(phone)
+    );
+
+
+    if (existingUser) {
+
+      return res.status(409).json({
+        success: false,
+        message:
+          "رقم الهوية أو رقم الهاتف مستخدم مسبقًا"
+      });
+
+    }
+
+
+    // ===============================
+    // تشفير كلمة المرور
+    // ===============================
+
+    const hashedPassword =
+      await bcrypt.hash(password, 10);
+
+
+    // ===============================
+    // استخراج أرقام هويات الزوجات
+    // ===============================
+
+    const wivesIds =
+      wivesArray.map(
+        wife => wife.nationalId
+      );
+
+
+    // ===============================
+    // حفظ المستخدم
+    // ===============================
+
+    const result = db.prepare(`
+      INSERT INTO users (
+        name,
+        national_id,
+        phone,
+        password,
+        marital_status,
+        wives_count,
+        wives_ids,
+        wives_data,
+        children_count,
+        children_data
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+
+      name.trim(),
+
+      String(nationalId),
+
+      String(phone),
+
+      hashedPassword,
+
+      maritalStatus,
+
+      wivesArray.length,
+
+      JSON.stringify(wivesIds),
+
+      JSON.stringify(wivesArray),
+
+      finalChildrenCount,
+
+      JSON.stringify(childrenArray)
+
+    );
+
+
+    const userId = result.lastInsertRowid;
+
+
+    // ===============================
+    // إضافة العضو إلى مجالس العائلة
+    // ===============================
+
+    const councils = db.prepare(`
+      SELECT id
+      FROM councils
+    `).all();
+
+
+    const addMember = db.prepare(`
+      INSERT OR IGNORE INTO council_members (
+        council_id,
+        user_id
+      )
+      VALUES (?, ?)
+    `);
+
+
+    for (const council of councils) {
+
+      addMember.run(
+        council.id,
+        userId
+      );
+
+    }
+
+
+    // ===============================
+    // إنشاء التوكن
+    // ===============================
+
+    const token = jwt.sign(
+      {
+        id: userId,
+        name: name.trim(),
+        nationalId: String(nationalId),
+        phone: String(phone)
+      },
+      JWT_SECRET,
+      {
+        expiresIn: "7d"
+      }
+    );
+
+
+    // ===============================
+    // الرد
+    // ===============================
+
+    return res.status(201).json({
+
+      success: true,
+
+      message: "تم إنشاء الحساب بنجاح",
+
+      token,
+
+      user: {
+        id: userId,
+        name: name.trim(),
+        nationalId: String(nationalId),
+        phone: String(phone),
+        maritalStatus,
+        wives: wivesArray,
+        children: childrenArray
+      }
+
+    });
+
+
+  } catch (error) {
+
+    console.error(
+      "REGISTER ERROR:",
+      error
+    );
+
+
+    return res.status(500).json({
+
+      success: false,
+
+      message:
+        "حدث خطأ أثناء إنشاء الحساب"
+
+    });
+
+  }
+
+});// ===============================
+// تسجيل الدخول
+// ===============================
+
+app.post("/api/login", async (req, res) => {
+
+  try {
+
+    const {
+      identifier,
+      password
+    } = req.body;
+
+
+    // ===============================
+    // التحقق من البيانات
+    // ===============================
+
+    if (!identifier || !password) {
+
+      return res.status(400).json({
+        success: false,
+        message:
+          "يرجى إدخال الاسم أو رقم الهوية أو رقم الهاتف وكلمة المرور"
+      });
+
+    }
+
+
+    // ===============================
+    // البحث عن المستخدم
+    // ===============================
+
+    const user = db.prepare(`
+      SELECT *
+      FROM users
+      WHERE name = ?
+         OR national_id = ?
+         OR phone = ?
+      LIMIT 1
+    `).get(
+      String(identifier).trim(),
+      String(identifier).trim(),
+      String(identifier).trim()
+    );
+
+
+    if (!user) {
+
+      return res.status(401).json({
+        success: false,
+        message:
+          "بيانات تسجيل الدخول غير صحيحة"
+      });
+
+    }
+
+
+    // ===============================
+    // التحقق من كلمة المرور
+    // ===============================
+
+    const passwordCorrect =
+      await bcrypt.compare(
+        password,
+        user.password
+      );
+
+
+    if (!passwordCorrect) {
+
+      return res.status(401).json({
+        success: false,
+        message:
+          "بيانات تسجيل الدخول غير صحيحة"
+      });
+
+    }
+
+
+    // ===============================
+    // إنشاء التوكن
+    // ===============================
+
+    const token = jwt.sign(
+      {
+        id: user.id,
+        name: user.name,
+        nationalId: user.national_id,
+        phone: user.phone
+      },
+      JWT_SECRET,
+      {
+        expiresIn: "7d"
+      }
+    );
+
+
+    // ===============================
+    // تجهيز الزوجات
+    // ===============================
+
+    let wives = [];
+
+    try {
+
+      wives = JSON.parse(
+        user.wives_data || "[]"
+      );
+
+    } catch {
+
+      wives = [];
+
+    }
+
+
+    // ===============================
+    // تجهيز الأبناء
+    // ===============================
+
+    let children = [];
+
+    try {
+
+      children = JSON.parse(
+        user.children_data || "[]"
+      );
+
+    } catch {
+
+      children = [];
+
+    }
+
+
+    // ===============================
+    // إرسال النتيجة
+    // ===============================
+
+    return res.json({
+
+      success: true,
+
+      message: "تم تسجيل الدخول بنجاح",
+
+      token,
+
+      user: {
+
+        id: user.id,
+
+        name: user.name,
+
+        nationalId: user.national_id,
+
+        phone: user.phone,
+
+        maritalStatus:
+          user.marital_status,
+
+        wivesCount:
+          user.wives_count,
+
+        wives,
+
+        childrenCount:
+          user.children_count,
+
+        children
+
+      }
+
+    });
+
+
+  } catch (error) {
+
+    console.error(
+      "LOGIN ERROR:",
+      error
+    );
+
+
+    return res.status(500).json({
+
+      success: false,
+
+      message:
+        "حدث خطأ أثناء تسجيل الدخول"
+
+    });
+
+  }
+
+});
+
+
+// ===============================
+// بيانات المستخدم الحالي
+// ===============================
+
+app.get("/api/me", authenticate, (req, res) => {
+
+  try {
+
+    const user = db.prepare(`
+      SELECT *
+      FROM users
+      WHERE id = ?
+    `).get(req.user.id);
+
+
+    if (!user) {
+
+      return res.status(404).json({
+
+        success: false,
+
+        message:
+          "المستخدم غير موجود"
+
+      });
+
+    }
+
+
+    let wives = [];
+
+    let children = [];
+
+
+    try {
+
+      wives = JSON.parse(
+        user.wives_data || "[]"
+      );
+
+    } catch {
+
+      wives = [];
+
+    }
+
+
+    try {
+
+      children = JSON.parse(
+        user.children_data || "[]"
+      );
+
+    } catch {
+
+      children = [];
+
+    }
+
+
+    return res.json({
+
+      success: true,
+
+      user: {
+
+        id: user.id,
+
+        name: user.name,
+
+        nationalId:
+          user.national_id,
+
+        phone:
+          user.phone,
+
+        maritalStatus:
+          user.marital_status,
+
+        wivesCount:
+          user.wives_count,
+
+        wives,
+
+        childrenCount:
+          user.children_count,
+
+        children,
+
+        createdAt:
+          user.created_at
+
+      }
+
+    });
+
+
+  } catch (error) {
+
+    console.error(
+      "ME ERROR:",
+      error
+    );
+
+
+    return res.status(500).json({
+
+      success: false,
+
+      message:
+        "حدث خطأ أثناء جلب بيانات الحساب"
+
+    });
+
+  }
+
+});// ===============================
+// جلب مجالس العائلة
+// ===============================
+
+app.get("/api/councils", authenticate, (req, res) => {
+
+  try {
+
+    const councils = db.prepare(`
+      SELECT
+        id,
+        name,
+        created_at
+      FROM councils
+      ORDER BY id ASC
+    `).all();
+
+
+    return res.json({
+
+      success: true,
+
+      councils
+
+    });
+
+  } catch (error) {
+
+    console.error(
+      "COUNCILS ERROR:",
+      error
+    );
+
+    return res.status(500).json({
+
+      success: false,
+
+      message:
+        "حدث خطأ أثناء جلب مجالس العائلة"
+
+    });
+
+  }
+
+});
+
+
+// ===============================
+// الانضمام إلى مجلس
+// ===============================
+
+app.post(
+  "/api/councils/:councilId/join",
+  authenticate,
+  (req, res) => {
+
+    try {
+
+      const councilId =
+        Number(req.params.councilId);
+
+
+      if (!Number.isInteger(councilId)) {
+
+        return res.status(400).json({
+
+          success: false,
+
+          message:
+            "رقم المجلس غير صحيح"
+
+        });
+
+      }
+
+
+      // التأكد من وجود المجلس
+
+      const council = db.prepare(`
+        SELECT *
+        FROM councils
+        WHERE id = ?
+      `).get(councilId);
+
+
+      if (!council) {
+
+        return res.status(404).json({
+
+          success: false,
+
+          message:
+            "المجلس غير موجود"
+
+        });
+
+      }
+
+
+      // إضافة العضو
+
+      db.prepare(`
+        INSERT OR IGNORE INTO council_members (
+          council_id,
+          user_id
+        )
+        VALUES (?, ?)
+      `).run(
+        councilId,
+        req.user.id
+      );
+
+
+      return res.json({
+
+        success: true,
+
+        message:
+          "تم الانضمام إلى المجلس بنجاح",
+
+        council
+
+      });
+
+    } catch (error) {
+
+      console.error(
+        "JOIN COUNCIL ERROR:",
+        error
+      );
+
+
+      return res.status(500).json({
+
+        success: false,
+
+        message:
+          "حدث خطأ أثناء الانضمام إلى المجلس"
+
+      });
+
+    }
+
+  }
+);
+
+
+// ===============================
+// التحقق من عضوية المستخدم
+// ===============================
+
+function requireCouncilMember(
+  req,
+  res,
+  next
+) {
+
+  try {
+
+    const councilId =
+      Number(req.params.councilId);
+
+
+    if (!Number.isInteger(councilId)) {
+
+      return res.status(400).json({
+
+        success: false,
+
+        message:
+          "رقم المجلس غير صحيح"
+
+      });
+
+    }
+
+
+    const member = db.prepare(`
+      SELECT id
+      FROM council_members
+      WHERE council_id = ?
+        AND user_id = ?
+    `).get(
+      councilId,
+      req.user.id
+    );
+
+
+    if (!member) {
+
+      return res.status(403).json({
+
+        success: false,
+
+        message:
+          "أنت لست عضوًا في هذا المجلس"
+
+      });
+
+    }
+
+
+    next();
+
+  } catch (error) {
+
+    console.error(
+      "MEMBERSHIP ERROR:",
+      error
+    );
+
+
+    return res.status(500).json({
+
+      success: false,
+
+      message:
+        "حدث خطأ أثناء التحقق من العضوية"
+
+    });
+
+  }
+
+}
+
+
+// ===============================
+// جلب أعضاء المجلس
+// ===============================
+
+app.get(
+  "/api/councils/:councilId/members",
+  authenticate,
+  requireCouncilMember,
+  (req, res) => {
+
+    try {
+
+      const councilId =
+        Number(req.params.councilId);
+
+
+      const members = db.prepare(`
+        SELECT
+          u.id,
+          u.name,
+          u.phone,
+          u.marital_status,
+          u.created_at
+        FROM council_members cm
+        INNER JOIN users u
+          ON u.id = cm.user_id
+        WHERE cm.council_id = ?
+        ORDER BY u.name ASC
+      `).all(councilId);
+
+
+      return res.json({
+
+        success: true,
+
+        members
+
+      });
+
+    } catch (error) {
+
+      console.error(
+        "MEMBERS ERROR:",
+        error
+      );
+
+
+      return res.status(500).json({
+
+        success: false,
+
+        message:
+          "حدث خطأ أثناء جلب أعضاء المجلس"
+
+      });
+
+    }
+
+  }
+);// ===============================
+// جلب منشورات المجلس
+// ===============================
+
+app.get(
+  "/api/councils/:councilId/posts",
+  authenticate,
+  requireCouncilMember,
+  (req, res) => {
+
+    try {
+
+      const councilId =
+        Number(req.params.councilId);
+
+      const posts = db.prepare(`
+        SELECT
+          p.id,
+          p.content,
+          p.created_at,
+          u.id AS user_id,
+          u.name AS user_name
+        FROM posts p
+        INNER JOIN users u
+          ON u.id = p.user_id
+        WHERE p.council_id = ?
+        ORDER BY p.created_at DESC
+      `).all(councilId);
+
+
+      return res.json({
+
+        success: true,
+
+        posts
+
+      });
+
+    } catch (error) {
+
+      console.error(
+        "GET POSTS ERROR:",
+        error
+      );
+
+      return res.status(500).json({
+
+        success: false,
+
+        message:
+          "حدث خطأ أثناء جلب المنشورات"
+
+      });
+
+    }
+
+  }
+);
+
+
+// ===============================
+// نشر خبر أو مناسبة في المجلس
+// ===============================
+
+app.post(
+  "/api/councils/:councilId/posts",
+  authenticate,
+  requireCouncilMember,
+  (req, res) => {
+
+    try {
+
+      const councilId =
+        Number(req.params.councilId);
+
+      const content =
+        typeof req.body.content === "string"
+          ? req.body.content.trim()
+          : "";
+
+
+      // التأكد من وجود النص
+
+      if (!content) {
+
+        return res.status(400).json({
+
+          success: false,
+
+          message:
+            "يرجى كتابة الخبر أو المناسبة"
+
+        });
+
+      }
+
+
+      // منع المنشورات الطويلة جدًا
+
+      if (content.length > 2000) {
+
+        return res.status(400).json({
+
+          success: false,
+
+          message:
+            "المنشور طويل جدًا، الحد الأقصى 2000 حرف"
+
+        });
+
+      }
+
+
+      // إضافة المنشور
+
+      const result = db.prepare(`
+        INSERT INTO posts (
+          council_id,
+          user_id,
+          content
+        )
+        VALUES (?, ?, ?)
+      `).run(
+        councilId,
+        req.user.id,
+        content
+      );
+
+
+      // جلب المنشور بعد إنشائه
+
+      const post = db.prepare(`
+        SELECT
+          p.id,
+          p.content,
+          p.created_at,
+          u.id AS user_id,
+          u.name AS user_name
+        FROM posts p
+        INNER JOIN users u
+          ON u.id = p.user_id
+        WHERE p.id = ?
+      `).get(result.lastInsertRowid);
+
+
+      return res.status(201).json({
+
+        success: true,
+
+        message:
+          "تم نشر الخبر أو المناسبة بنجاح",
+
+        post
+
+      });
+
+    } catch (error) {
+
+      console.error(
+        "CREATE POST ERROR:",
+        error
+      );
+
+      return res.status(500).json({
+
+        success: false,
+
+        message:
+          "حدث خطأ أثناء نشر الخبر"
+
+      });
+
+    }
+
+  }
+);
+
+
+// ===============================
+// الصفحة الرئيسية للسيرفر
+// ===============================
+
+app.get("/", (req, res) => {
+
+  res.send(
+    "خادم موقع عائلة الطلاع يعمل بنجاح ✅"
+  );
+
+});
+
+
+//
